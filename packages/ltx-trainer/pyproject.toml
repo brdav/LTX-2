@@ -20,6 +20,7 @@ dependencies = [
     "opencv-python>=4.11.0.86",
     "optimum-quanto>=0.2.6",
     "pandas>=2.2.3",
+    "pyarrow>=15.0.0",
     "peft>=0.14.0",
     "pillow-heif>=0.21.0",
     "pydantic>=2.10.4",
