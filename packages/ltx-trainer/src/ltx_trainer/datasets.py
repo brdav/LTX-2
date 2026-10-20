@@ -1,8 +1,10 @@
+import json
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import torch
 from einops import rearrange
+from safetensors import safe_open
 from torch import Tensor
 from torch.utils.data import Dataset
 
@@ -307,3 +309,45 @@ class PrecomputedDataset(Dataset):
             data["latents"] = latents
 
         return data
+
+
+class PackedLatentDataset(Dataset):
+    """Clip-level reader for latents packed one safetensors file per source video (see ``tokenize_natix.py``).
+
+    Samples come from the JSONL index (``<root>/index/*.jsonl``) rather than a directory glob. Each item is read with a
+    memory-mapped slice, so only that clip's bytes are touched. Returns the same dict as a ``latents/*.pt`` source:
+    ``latents`` [C, F, H, W], ``num_frames``, ``height``, ``width``, ``fps``.
+    Multi-view: pass several ``views``; the item then holds ``latents`` [V, C, F, H, W] stacked in that order, and
+    only clips that have every requested view are used.
+    """
+
+    def __init__(self, root: str, views: tuple[str, ...] = ("front",)) -> None:
+        super().__init__()
+        self.root, self.views = Path(root).expanduser().resolve(), views
+        rows: dict[tuple[str, str], dict[str, str]] = {}  # (file, start) -> {view: key}; dict dedupes requeued rows
+        for index_file in sorted((self.root / "index").glob("*.jsonl")):
+            for line in index_file.read_text().splitlines():
+                row = json.loads(line)
+                rows.setdefault((row["file"], f"{row['start_frame']:06d}"), {})[row["view"]] = row["key"]
+        self.samples = [
+            (f, [keys[v] for v in views]) for (f, _), keys in sorted(rows.items()) if all(v in keys for v in views)
+        ]
+        if not self.samples:
+            raise ValueError(f"No clips with views {views} found in {self.root / 'index'}")
+        logger.info(f"PackedLatentDataset: {len(self.samples)} clips, views {views}")
+
+    def __len__(self) -> int:
+        return len(self.samples)
+
+    def __getitem__(self, index: int) -> dict[str, Tensor]:
+        file, keys = self.samples[index]
+        with safe_open(str(self.root / file), framework="pt", device="cpu") as f:
+            meta = f.metadata()
+            latents = torch.stack([f.get_tensor(k) for k in keys]) if len(keys) > 1 else f.get_tensor(keys[0])
+        return {
+            "latents": latents,
+            "num_frames": int(meta["num_frames"]),
+            "height": int(meta["height"]),
+            "width": int(meta["width"]),
+            "fps": float(meta["fps"]),
+        }

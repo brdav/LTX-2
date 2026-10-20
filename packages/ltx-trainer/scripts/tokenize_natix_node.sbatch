@@ -4,21 +4,26 @@
 # Each array task takes 4 shards; total shards = 4 * array size.
 #SBATCH --job-name=natix-tok
 #SBATCH --account=ab036
-#SBATCH --partition=preemptable
+#SBATCH --partition=normal
 #SBATCH --nodes=1
 #SBATCH --ntasks=4
 #SBATCH --gpus-per-task=1
 #SBATCH --cpus-per-task=72
 #SBATCH --exclusive
-#SBATCH --time=24:00:00
+#SBATCH --time=12:00:00
 #SBATCH --requeue
-#SBATCH --output=/iopsstor/scratch/cscs/%u/tokenized_datasets/logs/natix_%A_%a.log
+#SBATCH --output=/capstor/store/cscs/swissai/ab036/processed_datasets/natix/tokenized/logs/natix_%A_%a.log
+
+# Use the following:
+# cd ~/LTX-2
+# RES=768x512 WORKERS=14 sbatch --array=0-7 packages/ltx-trainer/scripts/tokenize_natix_node.sbatch
+# RES=1248x832 WORKERS=4 sbatch --array=0-15 packages/ltx-trainer/scripts/tokenize_natix_node.sbatch
 
 set -euo pipefail
 CAP=/capstor/store/cscs/swissai/ab036
 RES=${RES:-768x512}
-OUT=${OUT:-/iopsstor/scratch/cscs/$USER/tokenized_datasets/natix_${RES}}
-WORKERS=${WORKERS:-24}
+OUT=${OUT:-/capstor/store/cscs/swissai/ab036/processed_datasets/natix/tokenized/natix_${RES}}
+WORKERS=${WORKERS:-14}
 EXTRA=${EXTRA:-}
 cd "$HOME/LTX-2"
 

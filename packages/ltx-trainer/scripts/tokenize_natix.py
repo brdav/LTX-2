@@ -9,8 +9,12 @@ For every source video referenced by the manifest:
 CPU work (ffmpeg, decoding, resize/crop) runs in DataLoader worker processes, one video per work item; the GPU
 process only normalizes and encodes. Run one process per GPU, each with its own ``--shard-index``.
 
-Latents are written as ``<output-dir>/latents/<source_video_path without .mp4>/f<start_frame>.pt`` in the same
-format as ``process_videos.py``. Existing outputs are skipped, so a rerun resumes.
+Latents are packed one safetensors file per source video:
+``<output-dir>/latents/<source_video_path without .mp4>.safetensors``, with one ``[C, F, H, W]`` tensor per clip under
+the key ``<start_frame:06d>/<view>`` (view = ``front`` for now; multi-view runs add ``back``, ``side``, ... keys for the
+same clip to the same file). File metadata holds the latent ``num_frames``/``height``/``width`` and ``fps``.
+Each shard also appends one JSON line per clip to ``<output-dir>/index/shard<N>.jsonl``
+(see ``ltx_trainer.datasets.PackedLatentDataset``). A video whose file exists is skipped, so a rerun resumes.
 """
 
 import argparse
@@ -30,11 +34,12 @@ import imageio_ffmpeg
 import numpy as np
 import pandas as pd
 import torch
+from safetensors.torch import save_file
 from torch.utils.data import DataLoader, Dataset
 
 from ltx_trainer import logger
 from ltx_trainer.model_loader import load_video_vae_encoder, read_video_scale_factors
-from ltx_trainer.process_videos import MediaDataset, _atomic_save, _encode_video
+from ltx_trainer.process_videos import MediaDataset, _encode_video
 
 EXPECTED_FRAMES = 121
 OUTPUT_FPS = 24.0
@@ -51,22 +56,31 @@ def _lower_priority(_worker_id: int) -> None:
     os.nice(10)
 
 
-def _save(latents: torch.Tensor, lat: dict, out: Path) -> None:
+def _save_video(
+    latents: torch.Tensor, starts: list[int], lat: dict, out: Path, view: str, root: Path, vpath: str
+) -> list[dict]:
+    """Write all clips of one source video (``latents``: [n_clips, C, F, H, W]) to one safetensors file.
+
+    Returns the index rows (one per clip) for the caller to append once the file is in place.
+    """
     out.parent.mkdir(parents=True, exist_ok=True)
-    _atomic_save(
-        {
-            "latents": latents.clone(),  # detach from the batch storage (torch.save writes the whole storage)
-            "num_frames": lat["num_frames"],
-            "height": lat["height"],
-            "width": lat["width"],
-            "fps": OUTPUT_FPS,
-        },
-        out,
+    keys = [f"{s:06d}/{view}" for s in starts]
+    tmp = out.with_suffix(f"{out.suffix}.tmp.{os.getpid()}")
+    save_file(
+        {k: latents[i].contiguous() for i, k in enumerate(keys)},
+        str(tmp),
+        metadata={k: str(lat[k]) for k in ("num_frames", "height", "width")} | {"fps": str(OUTPUT_FPS)},
     )
+    tmp.replace(out)
+    rel = str(out.relative_to(root))
+    return [
+        {"source_video_path": vpath, "start_frame": s, "view": view, "file": rel, "key": k}
+        for s, k in zip(starts, keys)
+    ]
 
 
-def output_file(output_dir: Path, source_video_path: str, start_frame: int) -> Path:
-    return output_dir / "latents" / Path(source_video_path).with_suffix("") / f"f{start_frame:06d}.pt"
+def output_file(output_dir: Path, source_video_path: str) -> Path:
+    return output_dir / "latents" / Path(source_video_path).with_suffix(".safetensors")
 
 
 class VideoClips(Dataset):
@@ -95,7 +109,7 @@ class VideoClips(Dataset):
         torch.set_num_threads(1)
         vpath = self.videos[i]
         res: dict = {"vpath": vpath, "starts": [], "clips": None, "t_ffmpeg": 0.0, "t_decode": 0.0, "skipped": 0}
-        rows = [r for r in self.groups[vpath].itertuples() if not output_file(self.out_dir, vpath, r.start_frame).is_file()]
+        rows = [] if output_file(self.out_dir, vpath).is_file() else list(self.groups[vpath].itertuples())
         res["skipped"] = len(self.groups[vpath]) - len(rows)
         if not rows:
             return res
@@ -153,7 +167,9 @@ def main() -> None:  # noqa: PLR0915
     ap.add_argument("--prefetch", type=int, default=2, help="Videos prefetched per worker")
     ap.add_argument("--encode-batch", type=int, default=1, help="Clips per VAE forward (1 = as process_videos.py)")
     ap.add_argument("--tmp-dir", default=None, help="Node-local scratch for resampled mp4s (default: $TMPDIR)")
-    ap.add_argument("--ffmpeg", default=None, help="ffmpeg binary (default: system ffmpeg, else bundled imageio-ffmpeg)")
+    ap.add_argument(
+        "--ffmpeg", default=None, help="ffmpeg binary (default: system ffmpeg, else bundled imageio-ffmpeg)"
+    )
     ap.add_argument("--vae-tiling", action="store_true")
     args = ap.parse_args()
 
@@ -189,6 +205,13 @@ def main() -> None:  # noqa: PLR0915
         worker_init_fn=_lower_priority,
     )
 
+    index_file = out_dir / "index" / f"shard{args.shard_index}.jsonl"
+    index_file.parent.mkdir(parents=True, exist_ok=True)
+
+    def write_index(rows: list[dict]) -> None:
+        with index_file.open("a") as f:
+            f.writelines(json.dumps(r) + "\n" for r in rows)
+
     saver = ThreadPoolExecutor(max_workers=4)
     pending_saves: list = []
     done = skipped = 0
@@ -212,19 +235,25 @@ def main() -> None:  # noqa: PLR0915
             if args.max_samples:
                 clips, starts = clips[: args.max_samples - done], starts[: args.max_samples - done]
             t = time.time()
+            encoded = []
             for b in range(0, len(starts), args.encode_batch):
                 x = clips[b : b + args.encode_batch].to(device, non_blocking=True)  # [B, F, C, H, W] bf16 in [-1, 1]
                 x = x.permute(0, 2, 1, 3, 4).contiguous()  # [B, C, F, H, W], as MediaDataset/process_videos
                 with torch.inference_mode():
                     lat = _encode_video(vae, x, use_tiling=args.vae_tiling, scale_factors=scale)
-                latents = lat["latents"].cpu()
-                for j, s in enumerate(starts[b : b + args.encode_batch]):
-                    pending_saves.append(saver.submit(_save, latents[j], lat, output_file(out_dir, vpath, s)))
-                    done += 1
+                encoded.append(lat["latents"].cpu())
+                done += len(starts[b : b + args.encode_batch])
             t_enc += time.time() - t
-        for fut in [f for f in pending_saves if f.done()]:
-            fut.result()
-        pending_saves = [f for f in pending_saves if not f.done()]
+            pending_saves.append(
+                saver.submit(
+                    _save_video, torch.cat(encoded), starts, lat, output_file(out_dir, vpath), "front", out_dir, vpath
+                )
+            )
+        # Snapshot once: a save finishing between two done() checks would otherwise lose its index rows.
+        finished = [f for f in pending_saves if f.done()]
+        for fut in finished:
+            write_index(fut.result())
+        pending_saves = [f for f in pending_saves if f not in finished]
         if (vi + 1) % 20 == 0 or vi + 1 == len(videos):
             el = time.time() - t0
             logger.info(
@@ -237,7 +266,7 @@ def main() -> None:  # noqa: PLR0915
         t_wait_start = time.time()
 
     for fut in pending_saves:
-        fut.result()
+        write_index(fut.result())
     saver.shutdown()
     logger.info(f"Done: {done} encoded, {skipped} already existed, {time.time() - t0:.0f}s")
 
