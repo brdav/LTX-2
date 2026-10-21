@@ -17,7 +17,7 @@
 # Use the following:
 # cd ~/LTX-2
 # RES=768x512 WORKERS=14 sbatch --array=0-7 packages/ltx-trainer/scripts/tokenize_natix_node.sbatch
-# RES=1248x832 WORKERS=4 sbatch --array=0-15 packages/ltx-trainer/scripts/tokenize_natix_node.sbatch
+# RES=1248x832 WORKERS=4 sbatch --array=0-23 packages/ltx-trainer/scripts/tokenize_natix_node.sbatch
 
 set -euo pipefail
 CAP=/capstor/store/cscs/swissai/ab036
