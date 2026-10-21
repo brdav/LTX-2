@@ -10,7 +10,7 @@ CPU work (ffmpeg, decoding, resize/crop) runs in DataLoader worker processes, on
 process only normalizes and encodes. Run one process per GPU, each with its own ``--shard-index``.
 
 Latents are packed one safetensors file per source video:
-``<output-dir>/latents/<source_video_path without .mp4>.safetensors``, with one ``[C, F, H, W]`` tensor per clip under
+``<output-dir>/latents/<country>/<rest of source_video_path joined by '__'>.safetensors``, with one ``[C, F, H, W]`` tensor per clip under
 the key ``<start_frame:06d>/<view>`` (view = ``front`` for now; multi-view runs add ``back``, ``side``, ... keys for the
 same clip to the same file). File metadata holds the latent ``num_frames``/``height``/``width`` and ``fps``.
 Each shard also appends one JSON line per clip to ``<output-dir>/index/shard<N>.jsonl``
@@ -79,8 +79,18 @@ def _save_video(
     ]
 
 
+def flat_relpath(source_video_path: str) -> Path:
+    """``<country>/<a>/<b>/.../<name>.mp4`` -> ``latents/<country>/<a>__<b>__...__<name>.safetensors``.
+
+    One directory per country instead of one per video, to keep the inode count low. Invertible: see
+    ``rebuild_natix_index.py`` (``unflatten``) and ``flatten_natix_layout.py``.
+    """
+    parts = Path(source_video_path).with_suffix("").parts
+    return Path("latents") / parts[0] / ("__".join(parts[1:]) + ".safetensors")
+
+
 def output_file(output_dir: Path, source_video_path: str) -> Path:
-    return output_dir / "latents" / Path(source_video_path).with_suffix(".safetensors")
+    return output_dir / flat_relpath(source_video_path)
 
 
 class VideoClips(Dataset):

@@ -22,9 +22,15 @@ from pathlib import Path
 from safetensors import safe_open
 
 
+def unflatten(rel: Path) -> str:
+    """Inverse of ``tokenize_natix.flat_relpath``: latents/<country>/<a>__<b>__<name>.safetensors -> <country>/<a>/<b>/<name>.mp4"""
+    country, name = rel.parts[1], rel.name.removesuffix(".safetensors")
+    return "/".join([country, *name.split("__")]) + ".mp4"
+
+
 def rows_for(path: Path, root: Path) -> list[dict]:
     rel = path.relative_to(root)
-    vpath = str(rel.relative_to("latents").with_suffix(".mp4"))
+    vpath = unflatten(rel)
     with safe_open(str(path), framework="pt", device="cpu") as f:
         keys = list(f.keys())
     return [
