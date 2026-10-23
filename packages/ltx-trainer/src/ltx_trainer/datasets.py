@@ -1,6 +1,7 @@
 import json
 import sys
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 from pathlib import Path
 
 import torch
@@ -317,6 +318,16 @@ def _read_packed_index(root: Path) -> list[dict]:
     return [json.loads(line) for f in sorted((root / "index").glob("*.jsonl")) for line in f.read_text().splitlines()]
 
 
+@dataclass
+class _AuxSource:
+    """One auxiliary packed source of a ``PackedLatentDataset`` (e.g. OSM maps, satellite crops)."""
+
+    root: Path
+    weights: dict[str, float]  # view -> sampling weight
+    per_clip: list[dict[str, tuple[str, str]]]  # per clip: {drawable view: (file, key)}, empty if none
+    zero: Tensor  # shape template for clips without it
+
+
 class PackedLatentDataset(Dataset):
     """Clip-level reader for latents packed one safetensors file per source video (see ``tokenize_natix.py``).
 
@@ -326,22 +337,24 @@ class PackedLatentDataset(Dataset):
     Multi-view: pass several ``views``; the item then holds ``latents`` [V, C, F, H, W] stacked in that order, and
     only clips that have every requested view are used.
 
-    Optional map latents: pass ``map_root`` (a packed root written by ``tokenize_natix_osm.py``) and every item also
-    carries ``map_latents`` (a latents dict of the same form, [C, 1, H, W], ``fps`` taken from the clip), ``map_view``
-    (the view that was loaded) and ``map_available``. The map is joined to the clip on ``(source_video_path,
-    start_frame)``. Each time an item is read, one view is drawn with probability proportional to
-    ``map_view_weights`` (e.g. ``{"map_matched": 0.7, "predicted": 0.3}``; default: equal over the views in the map
-    index), among the views that exist for that clip. With ``require_map`` only clips with at least one usable map view
-    are kept; without it, the other clips are kept with zero ``map_latents`` and ``map_available=False``.
+    Auxiliary sources: ``aux_roots`` maps a name to a packed root of per-clip stills, e.g. ``{"osm": <root of
+    tokenize_natix_osm.py>, "satellite": <root of tokenize_natix_satellite.py>}``. Every item then also carries, per
+    name, ``<name>_latents`` (a latents dict of the same form, [C, 1, H, W], ``fps`` taken from the clip),
+    ``<name>_view`` (the view that was loaded) and ``<name>_available``. An auxiliary latent is joined to its clip on
+    ``(source_video_path, start_frame)``. Each time an item is read, one view per source is drawn with probability
+    proportional to ``aux_view_weights[name]`` (e.g. ``{"osm": {"map_matched": 0.7, "predicted": 0.3}}``; default:
+    equal over the views in that source's index), among the views that exist for that clip.
+    ``require`` lists the sources a clip must have to be kept (default: all of them; ``()``: keep every clip). Clips
+    kept without a source get zero latents and ``<name>_available=False``, so default collation still works.
     """
 
     def __init__(
         self,
         root: str,
         views: tuple[str, ...] = ("front",),
-        map_root: str | None = None,
-        map_view_weights: dict[str, float] | None = None,
-        require_map: bool = True,
+        aux_roots: dict[str, str] | None = None,
+        aux_view_weights: dict[str, dict[str, float]] | None = None,
+        require: tuple[str, ...] | None = None,
     ) -> None:
         super().__init__()
         self.root, self.views = Path(root).expanduser().resolve(), views
@@ -355,51 +368,62 @@ class PackedLatentDataset(Dataset):
         if not self.samples:
             raise ValueError(f"No clips with views {views} found in {self.root / 'index'}")
 
-        self.map_root = None
-        if map_root is not None:
-            self._init_maps(Path(map_root).expanduser().resolve(), [clip_ids[fs] for fs in keep], map_view_weights)
-            if require_map:
-                kept = [i for i, m in enumerate(self.maps) if m]
-                self.samples, self.maps = [self.samples[i] for i in kept], [self.maps[i] for i in kept]
-                if not self.samples:
-                    raise ValueError(f"No clips of {self.root} have a map in {self.map_root / 'index'}")
-        self.require_map = require_map
+        aux_roots, aux_view_weights = aux_roots or {}, aux_view_weights or {}
+        if unknown := set(aux_view_weights) - set(aux_roots):
+            raise ValueError(f"aux_view_weights for unknown sources {sorted(unknown)}; sources are {sorted(aux_roots)}")
+        ids = [clip_ids[fs] for fs in keep]
+        self.aux = {
+            name: self._init_aux(name, Path(r).expanduser().resolve(), ids, aux_view_weights.get(name))
+            for name, r in aux_roots.items()
+        }
+        required = tuple(self.aux) if require is None else require
+        if unknown := set(required) - set(self.aux):
+            raise ValueError(f"require names unknown sources {sorted(unknown)}; sources are {sorted(self.aux)}")
+        if required:
+            kept = [i for i in range(len(self.samples)) if all(self.aux[n].per_clip[i] for n in required)]
+            if not kept:
+                raise ValueError(f"No clips of {self.root} have all of {required}")
+            self.samples = [self.samples[i] for i in kept]
+            for aux in self.aux.values():
+                aux.per_clip = [aux.per_clip[i] for i in kept]
         logger.info(
             f"PackedLatentDataset: {len(self.samples)} clips, views {views}"
-            + (f", maps from {self.map_root} ({sum(bool(m) for m in self.maps)} with a map)" if self.map_root else "")
+            + "".join(
+                f", {name} from {aux.root} ({sum(bool(m) for m in aux.per_clip)} with it)"
+                for name, aux in self.aux.items()
+            )
         )
 
-    def _init_maps(self, map_root: Path, ids: list[tuple[str, int]], weights: dict[str, float] | None) -> None:
-        """Look up, for every clip (``ids``: source_video_path, start_frame), its map latents per view."""
-        self.map_root = map_root
+    def _init_aux(
+        self, name: str, aux_root: Path, ids: list[tuple[str, int]], weights: dict[str, float] | None
+    ) -> _AuxSource:
+        """Look up, for every clip (``ids``: source_video_path, start_frame), its latents per view in ``aux_root``."""
         wanted = set(ids)
         found: dict[tuple[str, int], dict[str, tuple[str, str]]] = {}
-        for row in _read_packed_index(map_root):
+        for row in _read_packed_index(aux_root):
             clip = (row["source_video_path"], row["start_frame"])
             if clip in wanted:
                 found.setdefault(clip, {})[row["view"]] = (sys.intern(row["file"]), row["key"])
         available_views = sorted({v for views in found.values() for v in views})
         if not available_views:
-            raise ValueError(f"No map latents matching the clips of {self.root} in {map_root / 'index'}")
-        self.map_weights = dict(weights) if weights is not None else dict.fromkeys(available_views, 1.0)
-        unknown = set(self.map_weights) - set(available_views)
-        if unknown or any(w < 0 for w in self.map_weights.values()) or not sum(self.map_weights.values()) > 0:
-            raise ValueError(f"Invalid map_view_weights {self.map_weights}; map views are {available_views}")
-        # Per clip: only the views that can be drawn (positive weight), empty if the clip has no usable map.
-        self.maps = [{v: fk for v, fk in found.get(c, {}).items() if self.map_weights.get(v, 0.0) > 0} for c in ids]
-        # Shape template for clips without a map (keeps default collation working when require_map=False).
-        first = next(m for m in self.maps if m)
-        file, key = next(iter(first.values()))
-        with safe_open(str(map_root / file), framework="pt", device="cpu") as f:
-            self._map_zero = torch.zeros_like(f.get_tensor(key))
+            raise ValueError(f"No {name} latents matching the clips of {self.root} in {aux_root / 'index'}")
+        weights = dict(weights) if weights is not None else dict.fromkeys(available_views, 1.0)
+        if set(weights) - set(available_views) or any(w < 0 for w in weights.values()) or not sum(weights.values()) > 0:
+            raise ValueError(f"Invalid view weights {weights} for {name}; its views are {available_views}")
+        # Per clip: only the views that can be drawn (positive weight), empty if the clip has no usable one.
+        per_clip = [{v: fk for v, fk in found.get(c, {}).items() if weights.get(v, 0.0) > 0} for c in ids]
+        file, key = next(iter(next(m for m in per_clip if m).values()))
+        with safe_open(str(aux_root / file), framework="pt", device="cpu") as f:
+            zero = torch.zeros_like(f.get_tensor(key))
+        return _AuxSource(aux_root, weights, per_clip, zero)
 
-    def _draw_view(self, available: dict[str, tuple[str, str]]) -> str:
+    @staticmethod
+    def _draw_view(aux: _AuxSource, available: dict[str, tuple[str, str]]) -> str:
         """One view of ``available``, with probability proportional to its weight (torch RNG: seeded per worker)."""
         names = sorted(available)
-        total = sum(self.map_weights[v] for v in names)
-        u = torch.rand(()).item() * total
+        u = torch.rand(()).item() * sum(aux.weights[v] for v in names)
         for v in names:
-            u -= self.map_weights[v]
+            u -= aux.weights[v]
             if u < 0:
                 return v
         return names[-1]
@@ -419,28 +443,28 @@ class PackedLatentDataset(Dataset):
             "width": int(meta["width"]),
             "fps": float(meta["fps"]),
         }
-        if self.map_root is not None:
-            item |= self._load_map(index, item["fps"])
+        for name, aux in self.aux.items():
+            item |= self._load_aux(name, aux, index, item["fps"])
         return item
 
-    def _load_map(self, index: int, fps: float) -> dict:
-        available = self.maps[index]
+    def _load_aux(self, name: str, aux: _AuxSource, index: int, fps: float) -> dict:
+        available = aux.per_clip[index]
         if not available:
-            view, map_latents, meta = "", self._map_zero, None
+            view, latents, meta = "", aux.zero, None
         else:
-            view = self._draw_view(available)
+            view = self._draw_view(aux, available)
             file, key = available[view]
-            with safe_open(str(self.map_root / file), framework="pt", device="cpu") as f:
-                meta, map_latents = f.metadata(), f.get_tensor(key)
-        _, num_frames, height, width = map_latents.shape
+            with safe_open(str(aux.root / file), framework="pt", device="cpu") as f:
+                meta, latents = f.metadata(), f.get_tensor(key)
+        _, num_frames, height, width = latents.shape
         return {
-            "map_latents": {
-                "latents": map_latents,
+            f"{name}_latents": {
+                "latents": latents,
                 "num_frames": int(meta["num_frames"]) if meta else num_frames,
                 "height": int(meta["height"]) if meta else height,
                 "width": int(meta["width"]) if meta else width,
                 "fps": fps,  # a still has no fps of its own; it takes the clip's so its temporal position matches
             },
-            "map_view": view,
-            "map_available": bool(available),
+            f"{name}_view": view,
+            f"{name}_available": bool(available),
         }

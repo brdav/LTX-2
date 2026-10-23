@@ -109,8 +109,10 @@ class MapZips(Dataset):
         return res
 
 
-def _save_zip(latents: torch.Tensor, rows: list, lat: dict, out: Path, root: Path) -> list[dict]:
-    """Write all images of one zip (``latents``: [n, n_views, C, 1, H, W]) to one safetensors file.
+def _save_zip(
+    latents: torch.Tensor, rows: list, lat: dict, out: Path, root: Path, views: tuple[str, ...] = tuple(VARIANTS)
+) -> list[dict]:
+    """Write all images of one zip (``latents``: [n, len(views), C, 1, H, W]) to one safetensors file.
 
     Returns the index rows (one per image and view) for the caller to append once the file is in place.
     """
@@ -125,14 +127,14 @@ def _save_zip(latents: torch.Tensor, rows: list, lat: dict, out: Path, root: Pat
             "v": v,
         }
         for n, (vp, s, member) in enumerate(rows)
-        for v, view in enumerate(VARIANTS)
+        for v, view in enumerate(views)
     ]
     assert len({e["key"] for e in entries}) == len(entries), f"duplicate keys in {out}"
     tmp = out.with_suffix(f"{out.suffix}.tmp.{os.getpid()}")
     save_file(
         {e["key"]: latents[e["n"], e["v"]].contiguous() for e in entries},
         str(tmp),
-        metadata={k: str(lat[k]) for k in ("num_frames", "height", "width")},
+        metadata={k: str(lat[k]) for k in ("num_frames", "height", "width")} | {"n_images": str(len(rows))},
     )
     tmp.replace(out)
     rel = str(out.relative_to(root))
