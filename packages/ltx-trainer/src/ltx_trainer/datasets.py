@@ -4,6 +4,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 
+import numpy as np
 import torch
 from einops import rearrange
 from safetensors import safe_open
@@ -328,6 +329,26 @@ class _AuxSource:
     zero: Tensor  # shape template for clips without it
 
 
+@dataclass
+class _AnchorSource:
+    """Anchor frames of a ``PackedLatentDataset``: a variable-length set of independent stills per clip.
+
+    Stored flat (numpy) so that the many millions of (clip, anchor) pairs stay small and do not get copied into every
+    DataLoader worker: clip ``i`` has the candidate ids ``keys[offsets[i]:offsets[i + 1]]`` in ``files[clip_file[i]]``.
+    """
+
+    root: Path
+    num_anchors: int
+    files: list[str]
+    clip_file: np.ndarray  # [n_clips] int32, index into files (-1: no anchors)
+    offsets: np.ndarray  # [n_clips + 1] int64
+    keys: np.ndarray  # [total] int64, candidate ids
+    zero: Tensor  # [C, 1, H, W] shape template
+
+    def count(self, i: int) -> int:
+        return int(self.offsets[i + 1] - self.offsets[i])
+
+
 class PackedLatentDataset(Dataset):
     """Clip-level reader for latents packed one safetensors file per source video (see ``tokenize_natix.py``).
 
@@ -346,6 +367,14 @@ class PackedLatentDataset(Dataset):
     equal over the views in that source's index), among the views that exist for that clip.
     ``require`` lists the sources a clip must have to be kept (default: all of them; ``()``: keep every clip). Clips
     kept without a source get zero latents and ``<name>_available=False``, so default collation still works.
+
+    Anchor frames: ``anchor_root`` is a packed root written by ``tokenize_natix_anchors.py`` (rows with
+    ``view="anchor"``), ``num_anchors`` = K. A clip has a variable number of anchors (about 11 on average, up to 50),
+    each an independent still (never a video), so every read draws a random subset of ``min(K, n)`` of them (without
+    replacement, torch RNG: seeded per worker). The item holds ``anchors_latents`` (a latents dict whose ``latents`` is
+    [K, C, 1, H, W], zero-padded when the clip has fewer than K), ``anchors_mask`` ([K] bool, True = real anchor) and
+    ``anchors_available``. ``"anchors"`` can be named in ``require`` like an auxiliary source (and is part of the
+    default), which keeps only the clips that have at least one anchor.
     """
 
     def __init__(
@@ -355,6 +384,8 @@ class PackedLatentDataset(Dataset):
         aux_roots: dict[str, str] | None = None,
         aux_view_weights: dict[str, dict[str, float]] | None = None,
         require: tuple[str, ...] | None = None,
+        anchor_root: str | None = None,
+        num_anchors: int = 8,
     ) -> None:
         super().__init__()
         self.root, self.views = Path(root).expanduser().resolve(), views
@@ -376,23 +407,77 @@ class PackedLatentDataset(Dataset):
             name: self._init_aux(name, Path(r).expanduser().resolve(), ids, aux_view_weights.get(name))
             for name, r in aux_roots.items()
         }
-        required = tuple(self.aux) if require is None else require
-        if unknown := set(required) - set(self.aux):
-            raise ValueError(f"require names unknown sources {sorted(unknown)}; sources are {sorted(self.aux)}")
+        if num_anchors < 1:
+            raise ValueError(f"num_anchors must be >= 1, got {num_anchors}")
+        self.anchors = (
+            self._init_anchors(Path(anchor_root).expanduser().resolve(), ids, num_anchors) if anchor_root else None
+        )
+        names = (*self.aux, *(("anchors",) if self.anchors else ()))
+        required = names if require is None else require
+        if unknown := set(required) - set(names):
+            raise ValueError(f"require names unknown sources {sorted(unknown)}; sources are {sorted(names)}")
         if required:
-            kept = [i for i in range(len(self.samples)) if all(self.aux[n].per_clip[i] for n in required)]
+            kept = [i for i in range(len(self.samples)) if all(self._has(n, i) for n in required)]
             if not kept:
                 raise ValueError(f"No clips of {self.root} have all of {required}")
             self.samples = [self.samples[i] for i in kept]
             for aux in self.aux.values():
                 aux.per_clip = [aux.per_clip[i] for i in kept]
+            if self.anchors:
+                a = self.anchors
+                a.clip_file = a.clip_file[kept]
+                counts = np.diff(a.offsets)[kept]
+                starts = a.offsets[:-1][kept]
+                a.keys = np.concatenate([a.keys[s : s + c] for s, c in zip(starts, counts, strict=True)])
+                a.offsets = np.concatenate([[0], np.cumsum(counts)])
         logger.info(
             f"PackedLatentDataset: {len(self.samples)} clips, views {views}"
             + "".join(
                 f", {name} from {aux.root} ({sum(bool(m) for m in aux.per_clip)} with it)"
                 for name, aux in self.aux.items()
             )
+            + (
+                f", anchors from {self.anchors.root} ({int((np.diff(self.anchors.offsets) > 0).sum())} with any, "
+                f"{len(self.anchors.keys)} in total, {self.anchors.num_anchors} per read)"
+                if self.anchors
+                else ""
+            )
         )
+
+    def _has(self, name: str, i: int) -> bool:
+        """Whether clip ``i`` has source ``name`` (an auxiliary source, or ``"anchors"``)."""
+        return self.anchors.count(i) > 0 if name == "anchors" else bool(self.aux[name].per_clip[i])
+
+    @staticmethod
+    def _init_anchors(anchor_root: Path, ids: list[tuple[str, int]], num_anchors: int) -> _AnchorSource:
+        """Look up, for every clip (``ids``: source_video_path, start_frame), its anchors in ``anchor_root``."""
+        position = {c: i for i, c in enumerate(ids)}
+        files: dict[str, int] = {}
+        per_clip: dict[int, tuple[int, set[int]]] = {}  # clip position -> (file index, candidate ids); a set dedupes
+        for row in _read_packed_index(anchor_root):
+            i = position.get((row["source_video_path"], row["start_frame"]))
+            if i is None or row.get("view", "anchor") != "anchor":
+                continue
+            file = files.setdefault(row["file"], len(files))
+            entry = per_clip.setdefault(i, (file, set()))
+            if entry[0] != file:
+                raise ValueError(f"Anchors of {row['source_video_path']}#{row['start_frame']} span several files")
+            entry[1].add(int(row["key"]))
+        if not per_clip:
+            raise ValueError(f"No anchor latents matching the clips in {anchor_root / 'index'}")
+        clip_file = np.full(len(ids), -1, dtype=np.int32)
+        counts = np.zeros(len(ids), dtype=np.int64)
+        for i, (file, keys) in per_clip.items():
+            clip_file[i], counts[i] = file, len(keys)
+        offsets = np.concatenate([[0], np.cumsum(counts)])
+        flat = np.empty(int(offsets[-1]), dtype=np.int64)
+        for i, (_, keys) in per_clip.items():
+            flat[offsets[i] : offsets[i + 1]] = sorted(keys)
+        names = list(files)
+        i0 = next(iter(per_clip))
+        with safe_open(str(anchor_root / names[per_clip[i0][0]]), framework="pt", device="cpu") as f:
+            zero = torch.zeros_like(f.get_tensor(str(next(iter(per_clip[i0][1])))))
+        return _AnchorSource(anchor_root, num_anchors, names, clip_file, offsets, flat, zero)
 
     def _init_aux(
         self, name: str, aux_root: Path, ids: list[tuple[str, int]], weights: dict[str, float] | None
@@ -445,7 +530,37 @@ class PackedLatentDataset(Dataset):
         }
         for name, aux in self.aux.items():
             item |= self._load_aux(name, aux, index, item["fps"])
+        if self.anchors:
+            item |= self._load_anchors(self.anchors, index, item["fps"])
         return item
+
+    @staticmethod
+    def _load_anchors(anchors: _AnchorSource, index: int, fps: float) -> dict:
+        """A random subset of at most ``num_anchors`` anchors of clip ``index``, zero-padded to ``num_anchors``."""
+        k, n = anchors.num_anchors, anchors.count(index)
+        latents, meta = anchors.zero.unsqueeze(0).repeat(k, 1, 1, 1, 1), None
+        mask = torch.zeros(k, dtype=torch.bool)
+        if n:
+            start = int(anchors.offsets[index])
+            chosen = anchors.keys[start + torch.randperm(n)[:k].numpy()]
+            with safe_open(
+                str(anchors.root / anchors.files[int(anchors.clip_file[index])]), framework="pt", device="cpu"
+            ) as f:
+                meta = f.metadata()
+                latents[: len(chosen)] = torch.stack([f.get_tensor(str(c)) for c in chosen])
+            mask[: len(chosen)] = True
+        _, _, num_frames, height, width = latents.shape
+        return {
+            "anchors_latents": {
+                "latents": latents,  # [K, C, 1, H, W]; each anchor is a separate still
+                "num_frames": int(meta["num_frames"]) if meta else num_frames,
+                "height": int(meta["height"]) if meta else height,
+                "width": int(meta["width"]) if meta else width,
+                "fps": fps,
+            },
+            "anchors_mask": mask,
+            "anchors_available": bool(n),
+        }
 
     def _load_aux(self, name: str, aux: _AuxSource, index: int, fps: float) -> dict:
         available = aux.per_clip[index]
