@@ -21,8 +21,9 @@
 
 set -euo pipefail
 CAP=/capstor/store/cscs/swissai/ab036
+DATA=${DATA:-$CAP/processed_datasets/natix}  # dataset root, e.g. $CAP/processed_datasets/natix-jp-uk
 RES=${RES:-768x768}
-OUT=${OUT:-/capstor/store/cscs/swissai/ab036/processed_datasets/natix/tokenized/natix_osm_${RES}}
+OUT=${OUT:-$DATA/tokenized/natix_osm_${RES}}
 WORKERS=${WORKERS:-14}
 EXTRA=${EXTRA:-}
 cd "$HOME/LTX-2"
@@ -31,12 +32,12 @@ TASK_ID=${SLURM_ARRAY_TASK_ID:-0}
 TASK_COUNT=${SLURM_ARRAY_TASK_COUNT:-1}
 export NUM_SHARDS=$((4 * TASK_COUNT))
 export BASE_SHARD=$((4 * TASK_ID))
-export CAP RES OUT WORKERS EXTRA
+export CAP DATA RES OUT WORKERS EXTRA
 
 # --kill-on-bad-exit=0: a single failing GPU process must not take the others down; rerun resumes anyway.
 srun --kill-on-bad-exit=0 bash -c '
 exec .venv/bin/python packages/ltx-trainer/scripts/tokenize_natix_osm.py \
-    --osm-root $CAP/processed_datasets/natix/osm_bev \
+    --osm-root $DATA/osm_bev \
     --output-dir $OUT \
     --vae-path $CAP/checkpoints/ltx-2.5/vae/ltx-2.5-video-vae-bf16.safetensors \
     --resolution $RES \

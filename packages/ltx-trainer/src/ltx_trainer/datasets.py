@@ -330,6 +330,17 @@ class _AuxSource:
 
 
 @dataclass
+class _TextSource:
+    """Caption embeddings of a ``PackedLatentDataset`` (e.g. OSM route captions from ``tokenize_natix_text.py``)."""
+
+    root: Path
+    max_tokens: int
+    per_clip: list[tuple[str, str, str] | None]  # per clip: (file, embedding key, mask key), None if no caption
+    dim: int  # embedding width
+    dtype: torch.dtype
+
+
+@dataclass
 class _AnchorSource:
     """Anchor frames of a ``PackedLatentDataset``: a variable-length set of independent stills per clip.
 
@@ -368,6 +379,14 @@ class PackedLatentDataset(Dataset):
     ``require`` lists the sources a clip must have to be kept (default: all of them; ``()``: keep every clip). Clips
     kept without a source get zero latents and ``<name>_available=False``, so default collation still works.
 
+    Caption embeddings: ``text_roots`` maps a name to a packed root written by ``tokenize_natix_text.py``, e.g.
+    ``{"osm_text": <root of text_route_predicted>}``. Joined on ``(source_video_path, start_frame)`` like the maps. The
+    stored embeddings hold only the real tokens (~25-220), so each is left-padded with zeros to ``text_max_tokens``
+    (default 1024, the layout of ``process_captions.py``; a longer caption raises). The item holds
+    ``<name>_embeds`` [text_max_tokens, D], ``<name>_mask`` ([text_max_tokens] int64, 1 = real token, 0 = padding) and
+    ``<name>_available``. Clips without a caption get zeros and mask 0. Names can be listed in ``require`` like the
+    auxiliary sources (and are part of the default).
+
     Anchor frames: ``anchor_root`` is a packed root written by ``tokenize_natix_anchors.py`` (rows with
     ``view="anchor"``), ``num_anchors`` = K. A clip has a variable number of anchors (about 11 on average, up to 50),
     each an independent still (never a video), so every read draws a random subset of ``min(K, n)`` of them (without
@@ -386,6 +405,8 @@ class PackedLatentDataset(Dataset):
         require: tuple[str, ...] | None = None,
         anchor_root: str | None = None,
         num_anchors: int = 8,
+        text_roots: dict[str, str] | None = None,
+        text_max_tokens: int = 1024,
     ) -> None:
         super().__init__()
         self.root, self.views = Path(root).expanduser().resolve(), views
@@ -412,7 +433,14 @@ class PackedLatentDataset(Dataset):
         self.anchors = (
             self._init_anchors(Path(anchor_root).expanduser().resolve(), ids, num_anchors) if anchor_root else None
         )
-        names = (*self.aux, *(("anchors",) if self.anchors else ()))
+        text_roots = text_roots or {}
+        if clash := set(text_roots) & {*aux_roots, "anchors"}:
+            raise ValueError(f"text_roots names clash with other sources: {sorted(clash)}")
+        self.text = {
+            name: self._init_text(name, Path(r).expanduser().resolve(), ids, text_max_tokens)
+            for name, r in text_roots.items()
+        }
+        names = (*self.aux, *self.text, *(("anchors",) if self.anchors else ()))
         required = names if require is None else require
         if unknown := set(required) - set(names):
             raise ValueError(f"require names unknown sources {sorted(unknown)}; sources are {sorted(names)}")
@@ -423,6 +451,8 @@ class PackedLatentDataset(Dataset):
             self.samples = [self.samples[i] for i in kept]
             for aux in self.aux.values():
                 aux.per_clip = [aux.per_clip[i] for i in kept]
+            for text in self.text.values():
+                text.per_clip = [text.per_clip[i] for i in kept]
             if self.anchors:
                 a = self.anchors
                 a.clip_file = a.clip_file[kept]
@@ -436,6 +466,10 @@ class PackedLatentDataset(Dataset):
                 f", {name} from {aux.root} ({sum(bool(m) for m in aux.per_clip)} with it)"
                 for name, aux in self.aux.items()
             )
+            + "".join(
+                f", {name} from {text.root} ({sum(m is not None for m in text.per_clip)} with it)"
+                for name, text in self.text.items()
+            )
             + (
                 f", anchors from {self.anchors.root} ({int((np.diff(self.anchors.offsets) > 0).sum())} with any, "
                 f"{len(self.anchors.keys)} in total, {self.anchors.num_anchors} per read)"
@@ -446,7 +480,28 @@ class PackedLatentDataset(Dataset):
 
     def _has(self, name: str, i: int) -> bool:
         """Whether clip ``i`` has source ``name`` (an auxiliary source, or ``"anchors"``)."""
-        return self.anchors.count(i) > 0 if name == "anchors" else bool(self.aux[name].per_clip[i])
+        if name == "anchors":
+            return self.anchors.count(i) > 0
+        if name in self.text:
+            return self.text[name].per_clip[i] is not None
+        return bool(self.aux[name].per_clip[i])
+
+    def _init_text(self, name: str, text_root: Path, ids: list[tuple[str, int]], max_tokens: int) -> _TextSource:
+        """Look up, for every clip (``ids``: source_video_path, start_frame), its caption embedding in ``text_root``."""
+        if max_tokens < 1:
+            raise ValueError(f"text_max_tokens must be >= 1, got {max_tokens}")
+        wanted = set(ids)
+        found: dict[tuple[str, int], tuple[str, str, str]] = {}  # a dict dedupes requeued rows
+        for row in _read_packed_index(text_root):
+            clip = (row["source_video_path"], row["start_frame"])
+            if clip in wanted:
+                found[clip] = (sys.intern(row["file"]), row["embedding_key"], row["mask_key"])
+        if not found:
+            raise ValueError(f"No {name} embeddings matching the clips of {self.root} in {text_root / 'index'}")
+        file, key, _ = next(iter(found.values()))
+        with safe_open(str(text_root / file), framework="pt", device="cpu") as f:
+            ref = f.get_tensor(key)
+        return _TextSource(text_root, max_tokens, [found.get(c) for c in ids], ref.shape[-1], ref.dtype)
 
     @staticmethod
     def _init_anchors(anchor_root: Path, ids: list[tuple[str, int]], num_anchors: int) -> _AnchorSource:
@@ -530,9 +585,27 @@ class PackedLatentDataset(Dataset):
         }
         for name, aux in self.aux.items():
             item |= self._load_aux(name, aux, index, item["fps"])
+        for name, text in self.text.items():
+            item |= self._load_text(name, text, index)
         if self.anchors:
             item |= self._load_anchors(self.anchors, index, item["fps"])
         return item
+
+    @staticmethod
+    def _load_text(name: str, text: _TextSource, index: int) -> dict:
+        """The caption embedding of clip ``index``, left-padded with zeros to ``max_tokens`` (zeros if it has none)."""
+        embeds = torch.zeros(text.max_tokens, text.dim, dtype=text.dtype)
+        mask = torch.zeros(text.max_tokens, dtype=torch.int64)
+        entry = text.per_clip[index]
+        if entry is not None:
+            file, emb_key, mask_key = entry
+            with safe_open(str(text.root / file), framework="pt", device="cpu") as f:
+                real, real_mask = f.get_tensor(emb_key), f.get_tensor(mask_key)
+            n = len(real)
+            if n > text.max_tokens:
+                raise ValueError(f"{name} caption of {file}::{emb_key} has {n} tokens > text_max_tokens={text.max_tokens}")
+            embeds[text.max_tokens - n :], mask[text.max_tokens - n :] = real, real_mask
+        return {f"{name}_embeds": embeds, f"{name}_mask": mask, f"{name}_available": entry is not None}
 
     @staticmethod
     def _load_anchors(anchors: _AnchorSource, index: int, fps: float) -> dict:

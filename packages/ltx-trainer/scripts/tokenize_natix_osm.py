@@ -57,7 +57,9 @@ def load_index(osm_root: Path) -> pd.DataFrame:
     """One row per image present in *all* variants: columns zip, member, source_video_path, start_frame."""
     per_view = []
     for view, variant in VARIANTS.items():
-        files = sorted((osm_root / variant).glob("index.shard*of*.jsonl"))
+        # sharded (``index.shard0of4.jsonl``) or a single ``index.jsonl``
+        vdir = osm_root / variant
+        files = sorted(vdir.glob("index.shard*of*.jsonl")) + sorted(vdir.glob("index.jsonl"))
         df = pd.concat([pd.read_json(f, lines=True)[["image", "sample_id", "start_frame"]] for f in files])
         per_view.append(df.drop_duplicates("image").set_index("image").add_suffix(f"_{view}"))
     df = pd.concat(per_view, axis=1, join="inner").reset_index()
