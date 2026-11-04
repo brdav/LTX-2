@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Encode the Natix route captions (``osm_bev/text_predicted``) into LTX text embeddings.
 
-``<text-root>/<country>/<date>/<session>.zip`` holds ``index.jsonl`` and ``text.jsonl`` (``name`` = ``<HH-MM-SS>_sNNNN.webp``,
+``<text-root>/<country>/[<date>/]<session>.zip`` holds ``index.jsonl`` and ``text.jsonl`` (``name`` = ``<HH-MM-SS>_sNNNN.webp``,
 ``sample_id`` = ``<source_video_path>#f<start_frame>``, ``caption``), one caption per 5-second sample, so captions join the
 video clips like the OSM maps (on ``(source_video_path, start_frame)``).
 
@@ -31,7 +31,7 @@ from safetensors.torch import save_file
 from ltx_trainer import logger
 from ltx_trainer.model_loader import embedding_weight_paths, load_embeddings_processor, load_text_encoder
 
-VIEW = "predicted"
+DEFAULT_FIELDS = "caption:predicted"  # text.jsonl field : view name (v2 also has caption_no_motion)
 
 
 def out_relpath(zip_rel: str) -> Path:
@@ -40,7 +40,7 @@ def out_relpath(zip_rel: str) -> Path:
     return Path("embeddings") / parts[0] / ("__".join(parts[1:]) + ".safetensors")
 
 
-def read_session(zip_path: Path) -> list[dict]:
+def read_session(zip_path: Path, fields: dict[str, str]) -> list[dict]:
     with zipfile.ZipFile(zip_path) as zf:
         rows = [json.loads(line) for line in zf.read("text.jsonl").decode().splitlines() if line.strip()]
     keys = [Path(r["name"]).stem for r in rows]
@@ -50,7 +50,7 @@ def read_session(zip_path: Path) -> list[dict]:
             "stem": k,
             "source_video_path": r["sample_id"].split("#f")[0],
             "start_frame": int(r["sample_id"].split("#f")[1]),
-            "caption": r["caption"].strip(),
+            "captions": {view: r[field].strip() for field, view in fields.items()},
         }
         for k, r in zip(keys, rows, strict=True)
     ]
@@ -61,12 +61,13 @@ def index_rows(rows: list[dict], rel: str) -> list[dict]:
         {
             "source_video_path": r["source_video_path"],
             "start_frame": r["start_frame"],
-            "view": VIEW,
+            "view": view,
             "file": rel,
-            "embedding_key": f"{r['stem']}/{VIEW}/video_prompt_embeds",
-            "mask_key": f"{r['stem']}/{VIEW}/prompt_attention_mask",
+            "embedding_key": f"{r['stem']}/{view}/video_prompt_embeds",
+            "mask_key": f"{r['stem']}/{view}/prompt_attention_mask",
         }
         for r in rows
+        for view in r["captions"]
     ]
 
 
@@ -90,6 +91,7 @@ def main() -> None:
     ap.add_argument("--output-dir", required=True)
     ap.add_argument("--model-path", required=True, help="LTX transformer checkpoint (for the embeddings processor)")
     ap.add_argument("--text-encoder-path", required=True)
+    ap.add_argument("--fields", default=DEFAULT_FIELDS, help="Comma-separated text.jsonl-field:view pairs to encode")
     ap.add_argument("--encode-batch", type=int, default=16, help="Captions per Gemma forward")
     ap.add_argument("--num-sessions", type=int, default=None, help="Only the first N sessions (testing)")
     ap.add_argument("--country", default=None)
@@ -98,7 +100,8 @@ def main() -> None:
     args = ap.parse_args()
 
     text_root, out_dir = Path(args.text_root), Path(args.output_dir)
-    zips = sorted(str(p.relative_to(text_root)) for p in text_root.glob("*/*/*.zip"))
+    fields = dict(p.split(":") for p in args.fields.split(","))
+    zips = sorted(str(p.relative_to(text_root)) for p in text_root.glob("**/*.zip"))
     if args.country:
         zips = [z for z in zips if z.split("/")[0] == args.country]
     if args.num_sessions:
@@ -133,30 +136,33 @@ def main() -> None:
         out = out_dir / out_relpath(z)
         rel = str(out_relpath(z))
         try:
-            rows = read_session(text_root / z)
+            rows = read_session(text_root / z, fields)
             for stale in out.parent.glob(f"{out.name}.tmp.*"):
                 stale.unlink()
             if out.is_file():
                 with safe_open(str(out), framework="pt", device="cpu") as f:
-                    n_done = int((f.metadata() or {}).get("n_captions", -1))
-                if n_done == len(rows):
+                    meta = f.metadata() or {}
+                    n_done = int(meta.get("n_captions", -1))
+                    views_done = meta.get("views", "predicted")
+                if n_done == len(rows) and views_done == ",".join(fields.values()):
                     skipped += len(rows)
                     if rel not in indexed:
                         with index_file.open("a") as f:
                             f.writelines(json.dumps(r) + "\n" for r in index_rows(rows, rel))
                     continue
-            enc = encode([r["caption"] for r in rows], text_encoder, processor, args.encode_batch)
             tensors = {}
-            for r, (emb, mask) in zip(rows, enc, strict=True):
-                tensors[f"{r['stem']}/{VIEW}/video_prompt_embeds"] = emb
-                tensors[f"{r['stem']}/{VIEW}/prompt_attention_mask"] = mask
+            for view in fields.values():
+                enc = encode([r["captions"][view] for r in rows], text_encoder, processor, args.encode_batch)
+                for r, (emb, mask) in zip(rows, enc, strict=True):
+                    tensors[f"{r['stem']}/{view}/video_prompt_embeds"] = emb
+                    tensors[f"{r['stem']}/{view}/prompt_attention_mask"] = mask
             out.parent.mkdir(parents=True, exist_ok=True)
             tmp = out.with_suffix(f"{out.suffix}.tmp.{os.getpid()}")
-            save_file(tensors, str(tmp), metadata={"n_captions": str(len(rows)), "caption_kind": "route_text_predicted"})
+            save_file(tensors, str(tmp), metadata={"n_captions": str(len(rows)), "views": ",".join(fields.values()), "caption_kind": "route_text_predicted"})
             tmp.replace(out)
             with index_file.open("a") as f:
                 f.writelines(json.dumps(r) + "\n" for r in index_rows(rows, rel))
-            done += len(rows)
+            done += len(rows) * len(fields)
         except Exception as e:
             logger.error(f"{z}: {e}")
             with fail_log.open("a") as f:

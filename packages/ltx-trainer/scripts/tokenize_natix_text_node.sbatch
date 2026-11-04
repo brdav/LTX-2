@@ -21,7 +21,9 @@
 
 set -euo pipefail
 CAP=/capstor/store/cscs/swissai/ab036
-OUT=${OUT:-$CAP/processed_datasets/natix/tokenized/text_route_predicted}
+DATA=${DATA:-$CAP/processed_datasets/natix}  # dataset root, e.g. $CAP/processed_datasets/natix-jp-uk
+TEXT=${TEXT:-text_predicted}  # captions dir under $DATA/osm_bev, e.g. text_predicted_v2
+OUT=${OUT:-$DATA/tokenized/text_route_${TEXT#text_}}
 EXTRA=${EXTRA:-}
 cd "$HOME/LTX-2"
 
@@ -29,11 +31,11 @@ TASK_ID=${SLURM_ARRAY_TASK_ID:-0}
 TASK_COUNT=${SLURM_ARRAY_TASK_COUNT:-1}
 export NUM_SHARDS=$((4 * TASK_COUNT))
 export BASE_SHARD=$((4 * TASK_ID))
-export CAP OUT EXTRA
+export CAP DATA TEXT OUT EXTRA
 
 srun --kill-on-bad-exit=0 bash -c '
 exec .venv/bin/python packages/ltx-trainer/scripts/tokenize_natix_text.py \
-    --text-root $CAP/processed_datasets/natix/osm_bev/text_predicted \
+    --text-root $DATA/osm_bev/$TEXT \
     --output-dir $OUT \
     --model-path $CAP/ltx-2-models/ltx-2.5/diffusion_models/ltx-2.5-22b-distilled-transformer-bf16.safetensors \
     --text-encoder-path $CAP/ltx-2-models/ltx-2.5/text_encoders/gemma4-12b-with-proj-ltx-2.5-bf16.safetensors \
