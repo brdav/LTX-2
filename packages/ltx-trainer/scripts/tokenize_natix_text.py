@@ -31,7 +31,7 @@ from safetensors.torch import save_file
 from ltx_trainer import logger
 from ltx_trainer.model_loader import embedding_weight_paths, load_embeddings_processor, load_text_encoder
 
-DEFAULT_FIELDS = "caption:predicted"  # text.jsonl field : view name (v2 also has caption_no_motion)
+DEFAULT_FIELDS = "caption_no_motion:predicted_no_motion"  # text.jsonl field : view name; pass "caption:predicted" for v1 zips
 
 
 def out_relpath(zip_rel: str) -> Path:
@@ -144,7 +144,7 @@ def main() -> None:
                     meta = f.metadata() or {}
                     n_done = int(meta.get("n_captions", -1))
                     views_done = meta.get("views", "predicted")
-                if n_done == len(rows) and views_done == ",".join(fields.values()):
+                if n_done == len(rows) and set(fields.values()) <= set(views_done.split(",")):  # a file with extra views counts as done
                     skipped += len(rows)
                     if rel not in indexed:
                         with index_file.open("a") as f:
