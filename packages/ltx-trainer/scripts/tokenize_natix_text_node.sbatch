@@ -27,12 +27,15 @@ OUT=${OUT:-$DATA/tokenized/text_route_${TEXT#text_}}
 EXTRA=${EXTRA:-}
 cd "$HOME/LTX-2"
 
-TASK_ID=${SLURM_ARRAY_TASK_ID:-0}
-TASK_COUNT=${SLURM_ARRAY_TASK_COUNT:-1}
+# TASKS="0 1 2 3" TASK_COUNT=4: run several array tasks one after another in a single job (e.g. on debug, which
+# limits submitted jobs per user). Default: this array task only.
+TASK_COUNT=${TASK_COUNT:-${SLURM_ARRAY_TASK_COUNT:-1}}
+TASKS=${TASKS:-${SLURM_ARRAY_TASK_ID:-0}}
 export NUM_SHARDS=$((4 * TASK_COUNT))
-export BASE_SHARD=$((4 * TASK_ID))
 export CAP DATA TEXT OUT EXTRA
 
+for TASK_ID in $TASKS; do
+export BASE_SHARD=$((4 * TASK_ID))
 srun --kill-on-bad-exit=0 bash -c '
 exec .venv/bin/python packages/ltx-trainer/scripts/tokenize_natix_text.py \
     --text-root $DATA/osm_bev/$TEXT \
@@ -40,3 +43,4 @@ exec .venv/bin/python packages/ltx-trainer/scripts/tokenize_natix_text.py \
     --model-path $CAP/ltx-2-models/ltx-2.5/diffusion_models/ltx-2.5-22b-distilled-transformer-bf16.safetensors \
     --text-encoder-path $CAP/ltx-2-models/ltx-2.5/text_encoders/gemma4-12b-with-proj-ltx-2.5-bf16.safetensors \
     --shard-index $((BASE_SHARD + SLURM_PROCID)) --num-shards $NUM_SHARDS $EXTRA'
+done
